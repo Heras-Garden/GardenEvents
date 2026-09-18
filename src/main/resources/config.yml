@@ -1,0 +1,9 @@
+events:
+  max-capacity: 1000
+  max-start-days: 30
+  max-duration-hours: 24
+
+admission:
+  opens-before-minutes: 30
+  closes-after-end-minutes: 15
+  radius-blocks: 8

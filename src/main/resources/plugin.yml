@@ -1,0 +1,30 @@
+name: GardenEvents
+version: '${project.version}'
+main: com.herasgarden.gardenevents.GardenEvents
+api-version: '26.2'
+author: Hera's Garden
+website: https://herasgarden.net
+description: Claimed venues, scheduled events, tickets, and admission for The Garden SMP.
+depend: [GardenCore, GardenLands]
+
+commands:
+  venue:
+    description: Register and manage Garden event venues.
+    usage: /venue <create|info|list|delete>
+  event:
+    description: Create, browse, buy tickets for, and enter Garden events.
+    usage: /event <create|list|info|buy|issue|admit|cancel>
+
+permissions:
+  gardenevents.admin:
+    default: op
+  gardenevents.venue:
+    default: true
+  gardenevents.venue.create:
+    default: true
+  gardenevents.event:
+    default: true
+  gardenevents.event.create:
+    default: true
+  gardenevents.event.buy:
+    default: true
