@@ -70,6 +70,7 @@ public final class GardenEvents extends JavaPlugin {
         }
 
         getServer().getPluginManager().registerEvents(new VenueAdmissionListener(events), this);
+        getServer().getPluginManager().registerEvents(new TicketShopSignListener(this, events), this);
 
         lastStartCheck = System.currentTimeMillis();
         getServer().getScheduler().runTaskTimer(this, this::announceEventStarts, 20L, 20L);
