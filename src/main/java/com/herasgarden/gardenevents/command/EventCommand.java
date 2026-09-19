@@ -2,6 +2,7 @@ package com.herasgarden.gardenevents.command;
 
 import com.herasgarden.gardencore.api.ui.GardenMessages;
 import com.herasgarden.gardenevents.EventService;
+import com.herasgarden.gardenevents.EventTime;
 import com.herasgarden.gardenevents.EventService.AdmissionResult;
 import com.herasgarden.gardenevents.EventService.CancellationResult;
 import com.herasgarden.gardenevents.model.EventRecord;
@@ -19,7 +20,6 @@ import org.bukkit.entity.Player;
 
 import java.sql.SQLException;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
@@ -53,7 +53,7 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
                 case "buy" -> buy(player, args);
                 case "issue" -> issue(player, args);
                 case "admit" -> admit(player);
-                case "later" -> GardenMessages.send(player, "Admission skipped for now.");
+                case "later" -> later(player);
                 case "cancel" -> cancel(player, args);
                 default -> usage(player);
             }
@@ -89,8 +89,9 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
 
         EventRecord event = events.createEvent(player, venueKey, startIn, duration, price, capacity, name);
         GardenMessages.send(player, "Event created: " + event.name() + ".");
-        GardenMessages.send(player, "Starts " + Instant.ofEpochMilli(event.startAt())
-                + " | Ticket: ⟡ " + event.ticketPrice() + ".");
+        GardenMessages.send(player, "Starts: " + EventTime.format(event.startAt())
+                + " | Ends: " + EventTime.format(event.endAt()) + ".");
+        GardenMessages.send(player, "Ticket: ⟡ " + event.ticketPrice() + ".");
     }
 
     private void list(Player player) throws SQLException {
@@ -109,6 +110,7 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
                             .clickEvent(ClickEvent.runCommand("/event info " + event.name()))
                             .hoverEvent(HoverEvent.showText(Component.text("View event details"))))
                     .append(Component.text(" @ " + venue.name(), NamedTextColor.GRAY))
+                    .append(Component.text(" | " + EventTime.format(event.startAt()), NamedTextColor.GRAY))
                     .append(Component.text(" | " + sold + "/" + event.capacity(), NamedTextColor.GRAY))
                     .append(Component.text(" | ⟡ " + event.ticketPrice(), NamedTextColor.GRAY))
                     .append(Component.text("  "))
@@ -126,8 +128,8 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
         VenueRecord venue = events.venue(event);
         int sold = events.soldTickets(event.id());
         GardenMessages.send(player, event.name() + " @ " + venue.name() + ".");
-        GardenMessages.send(player, "Starts: " + Instant.ofEpochMilli(event.startAt())
-                + " | Ends: " + Instant.ofEpochMilli(event.endAt()) + ".");
+        GardenMessages.send(player, "Starts: " + EventTime.format(event.startAt())
+                + " | Ends: " + EventTime.format(event.endAt()) + ".");
         GardenMessages.send(player, "Tickets: " + sold + "/" + event.capacity()
                 + " | Price: ⟡ " + event.ticketPrice()
                 + " | Status: " + event.status() + ".");
@@ -188,6 +190,14 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
     private void admit(Player player) throws SQLException {
         AdmissionResult result = events.admit(player);
         GardenMessages.send(player, "Ticket accepted. Welcome to " + result.event().name() + ".");
+    }
+
+    private void later(Player player) {
+        if (events.declineAdmission(player)) {
+            GardenMessages.send(player, "Admission skipped. Your ticket was not used.");
+        } else {
+            GardenMessages.send(player, "There is no pending admission to decline.");
+        }
     }
 
     private void cancel(Player player, String[] args) throws SQLException {
