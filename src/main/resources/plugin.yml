@@ -13,7 +13,7 @@ commands:
     usage: /venue <create|info|list|buy|admit|later|settings|setprice|setopen|setentrance|delete>
   event:
     description: Create, browse, buy tickets for, and enter Garden events.
-    usage: /event <create|list|info|buy|issue|admit|later|cancel>
+    usage: /event <create|list|info|buy|issue|admit|later|settings|setprice|setcapacity|reschedule|cancel>
 
 permissions:
   gardenevents.admin:
