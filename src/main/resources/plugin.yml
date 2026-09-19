@@ -10,10 +10,10 @@ depend: [GardenCore, GardenLands]
 commands:
   venue:
     description: Register and manage Garden event venues.
-    usage: /venue <create|info|list|delete>
+    usage: /venue <create|info|list|buy|admit|later|settings|setprice|setopen|setentrance|delete>
   event:
     description: Create, browse, buy tickets for, and enter Garden events.
-    usage: /event <create|list|info|buy|issue|admit|cancel>
+    usage: /event <create|list|info|buy|issue|admit|later|cancel>
 
 permissions:
   gardenevents.admin:
@@ -21,6 +21,8 @@ permissions:
   gardenevents.venue:
     default: true
   gardenevents.venue.create:
+    default: true
+  gardenevents.venue.buy:
     default: true
   gardenevents.event:
     default: true
