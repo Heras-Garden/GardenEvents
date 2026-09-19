@@ -1236,6 +1236,102 @@ public final class EventService {
         return false;
     }
 
+    public boolean canManageVenue(Player actor, VenueRecord venue) {
+        return canManage(actor, venue);
+    }
+
+    public boolean canManageEvent(Player actor, EventRecord event) throws SQLException {
+        if (actor.hasPermission("gardenevents.admin")) return true;
+        if (event.hostId().equals(actor.getUniqueId())) return true;
+        return canManage(actor, venue(event));
+    }
+
+    public EventRecord setEventPrice(Player actor, EventRecord requested, long price) throws SQLException {
+        if (price < 0) throw new IllegalArgumentException("Ticket price cannot be negative.");
+        EventRecord event = managedScheduledEvent(actor, requested);
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_events SET ticket_price = ? WHERE event_uuid = ?")) {
+            statement.setLong(1, price);
+            statement.setString(2, event.id().toString());
+            statement.executeUpdate();
+        }
+        return findEvent(event.id()).orElseThrow();
+    }
+
+    public EventRecord setEventCapacity(Player actor, EventRecord requested, int capacity) throws SQLException {
+        EventRecord event = managedScheduledEvent(actor, requested);
+        if (capacity < 1 || capacity > maxCapacity) {
+            throw new IllegalArgumentException("Event capacity must be between 1 and " + maxCapacity + ".");
+        }
+        int sold = soldTickets(event.id());
+        if (capacity < sold) {
+            throw new IllegalArgumentException("Capacity cannot be lower than the " + sold + " tickets already issued.");
+        }
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_events SET capacity = ? WHERE event_uuid = ?")) {
+            statement.setInt(1, capacity);
+            statement.setString(2, event.id().toString());
+            statement.executeUpdate();
+        }
+        return findEvent(event.id()).orElseThrow();
+    }
+
+    public EventRecord rescheduleEvent(
+            Player actor, EventRecord requested, long startDelayMillis, long durationMillis) throws SQLException {
+        EventRecord event = managedScheduledEvent(actor, requested);
+        if (soldTickets(event.id()) > 0) {
+            throw new IllegalArgumentException(
+                    "An event cannot be rescheduled after tickets have been issued because the physical tickets show its start time.");
+        }
+        if (startDelayMillis < 60_000L || startDelayMillis > maxStartDelayMillis) {
+            throw new IllegalArgumentException("Event start time is outside the allowed scheduling window.");
+        }
+        if (durationMillis < 5L * 60_000L || durationMillis > maxDurationMillis) {
+            throw new IllegalArgumentException("Event duration is outside the allowed range.");
+        }
+
+        long startAt = Math.addExact(System.currentTimeMillis(), startDelayMillis);
+        long endAt = Math.addExact(startAt, durationMillis);
+        if (overlapsExcluding(event.venueId(), event.id(), startAt, endAt)) {
+            throw new IllegalArgumentException("That venue already has an overlapping scheduled event.");
+        }
+
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_events SET start_at = ?, end_at = ? WHERE event_uuid = ?")) {
+            statement.setLong(1, startAt);
+            statement.setLong(2, endAt);
+            statement.setString(3, event.id().toString());
+            statement.executeUpdate();
+        }
+        return findEvent(event.id()).orElseThrow();
+    }
+
+    private EventRecord managedScheduledEvent(Player actor, EventRecord requested) throws SQLException {
+        EventRecord event = findEvent(requested.id())
+                .orElseThrow(() -> new IllegalArgumentException("That event no longer exists."));
+        if (!event.scheduled()) throw new IllegalArgumentException("That event is no longer scheduled.");
+        if (!canManageEvent(actor, event)) throw new IllegalArgumentException("You do not manage this event.");
+        return event;
+    }
+
+    private boolean overlapsExcluding(UUID venueId, UUID eventId, long startAt, long endAt) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT 1 FROM gev_events WHERE venue_uuid = ? AND event_uuid <> ? "
+                             + "AND status = 'SCHEDULED' AND start_at < ? AND end_at > ? LIMIT 1")) {
+            statement.setString(1, venueId.toString());
+            statement.setString(2, eventId.toString());
+            statement.setLong(3, endAt);
+            statement.setLong(4, startAt);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        }
+    }
+
     private boolean overlaps(UUID venueId, long startAt, long endAt) throws SQLException {
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
