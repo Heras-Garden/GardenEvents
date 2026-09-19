@@ -693,6 +693,19 @@ public final class EventService {
         return physicalVenueTicket(player, venueId).isPresent();
     }
 
+    public boolean wasAdmitted(Player player, UUID eventId) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT 1 FROM gev_tickets WHERE event_uuid = ? AND status = 'USED' "
+                             + "AND admitted_player_uuid = ? LIMIT 1")) {
+            statement.setString(1, eventId.toString());
+            statement.setString(2, player.getUniqueId().toString());
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        }
+    }
+
     public Optional<EventRecord> eventAcceptingAdmissionAt(Player player) throws SQLException {
         VenueRecord venue = venueAt(player).orElse(null);
         return eventAcceptingAdmissionAt(venue);
@@ -753,10 +766,11 @@ public final class EventService {
 
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
-                     "UPDATE gev_tickets SET status = 'USED', used_at = ? "
+                     "UPDATE gev_tickets SET status = 'USED', used_at = ?, admitted_player_uuid = ? "
                              + "WHERE ticket_uuid = ? AND status = 'VALID'")) {
             statement.setLong(1, now);
-            statement.setString(2, physical.ticket().id().toString());
+            statement.setString(2, player.getUniqueId().toString());
+            statement.setString(3, physical.ticket().id().toString());
             if (statement.executeUpdate() != 1) {
                 throw new IllegalArgumentException("That ticket changed before admission could complete.");
             }
