@@ -70,6 +70,7 @@ public final class GardenEvents extends JavaPlugin {
         }
 
         getServer().getPluginManager().registerEvents(new VenueAdmissionListener(events), this);
+        getServer().getPluginManager().registerEvents(new TicketShopSignListener(this, events), this);
 
         lastStartCheck = System.currentTimeMillis();
         getServer().getScheduler().runTaskTimer(this, this::announceEventStarts, 20L, 20L);
@@ -101,7 +102,8 @@ public final class GardenEvents extends JavaPlugin {
             for (EventRecord event : starting) {
                 VenueRecord venue = events.venue(event);
                 for (Player player : getServer().getOnlinePlayers()) {
-                    if (!events.hasValidPhysicalTicket(player, event.id())) {
+                    if (!events.hasValidPhysicalTicket(player, event.id())
+                            && !events.wasAdmitted(player, event.id())) {
                         continue;
                     }
                     player.playSound(

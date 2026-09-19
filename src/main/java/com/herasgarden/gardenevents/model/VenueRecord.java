@@ -13,6 +13,8 @@ public record VenueRecord(
         double x,
         double y,
         double z,
+        boolean ticketRequired,
+        long ticketPrice,
         long createdAt
 ) {
 }

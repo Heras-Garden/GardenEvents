@@ -9,6 +9,7 @@ import com.herasgarden.gardencore.api.order.OrderType;
 import com.herasgarden.gardenevents.model.EventRecord;
 import com.herasgarden.gardenevents.model.TicketRecord;
 import com.herasgarden.gardenevents.model.VenueRecord;
+import com.herasgarden.gardenevents.model.VenueTicketRecord;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.Bukkit;
@@ -48,7 +49,10 @@ public final class EventService {
     private final double admissionRadiusSquared;
     private final NamespacedKey ticketKey;
     private final NamespacedKey eventKey;
+    private final NamespacedKey venueTicketKey;
+    private final NamespacedKey venueKey;
     private final Map<UUID, Object> purchaseLocks = new ConcurrentHashMap<>();
+    private final Map<UUID, Location> pendingAdmissionExit = new ConcurrentHashMap<>();
 
     public EventService(
             JavaPlugin plugin,
@@ -73,6 +77,8 @@ public final class EventService {
         this.admissionRadiusSquared = radius * radius;
         this.ticketKey = new NamespacedKey(plugin, "ticket-id");
         this.eventKey = new NamespacedKey(plugin, "event-id");
+        this.venueTicketKey = new NamespacedKey(plugin, "venue-ticket-id");
+        this.venueKey = new NamespacedKey(plugin, "venue-id");
     }
 
     public VenueRecord createVenue(Player owner, String name) throws SQLException {
@@ -103,14 +109,15 @@ public final class EventService {
         long now = System.currentTimeMillis();
         VenueRecord venue = new VenueRecord(
                 id, claimId, owner.getUniqueId(), cleanName, key, world.getUID(), world.getName(),
-                location.getX(), location.getY(), location.getZ(), now
+                location.getX(), location.getY(), location.getZ(), false, 0L, now
         );
 
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
                      "INSERT INTO gev_venues "
-                             + "(venue_uuid, claim_uuid, owner_uuid, name, name_key, world_uuid, world_name, x, y, z, created_at) "
-                             + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                             + "(venue_uuid, claim_uuid, owner_uuid, name, name_key, world_uuid, world_name, x, y, z, "
+                             + "ticket_required, ticket_price, created_at) "
+                             + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
             statement.setString(1, id.toString());
             statement.setString(2, claimId.toString());
             statement.setString(3, owner.getUniqueId().toString());
@@ -121,7 +128,9 @@ public final class EventService {
             statement.setDouble(8, venue.x());
             statement.setDouble(9, venue.y());
             statement.setDouble(10, venue.z());
-            statement.setLong(11, now);
+            statement.setInt(11, 0);
+            statement.setLong(12, 0L);
+            statement.setLong(13, now);
             statement.executeUpdate();
         }
         return venue;
@@ -134,6 +143,18 @@ public final class EventService {
              PreparedStatement statement = connection.prepareStatement(
                      "SELECT * FROM gev_venues WHERE name_key = ? LIMIT 1")) {
             statement.setString(1, normalized);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? Optional.of(readVenue(result)) : Optional.empty();
+            }
+        }
+    }
+
+    public Optional<VenueRecord> findVenue(UUID venueId) throws SQLException {
+        if (venueId == null) return Optional.empty();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT * FROM gev_venues WHERE venue_uuid = ? LIMIT 1")) {
+            statement.setString(1, venueId.toString());
             try (ResultSet result = statement.executeQuery()) {
                 return result.next() ? Optional.of(readVenue(result)) : Optional.empty();
             }
@@ -153,7 +174,12 @@ public final class EventService {
     }
 
     public Optional<VenueRecord> venueAt(Player player) throws SQLException {
-        UUID claimId = land.claimIdAt(player.getLocation().getBlock()).orElse(null);
+        return venueAt(player.getLocation());
+    }
+
+    public Optional<VenueRecord> venueAt(Location location) throws SQLException {
+        if (location == null || location.getWorld() == null) return Optional.empty();
+        UUID claimId = land.claimIdAt(location.getBlock()).orElse(null);
         return claimId == null ? Optional.empty() : venueForClaim(claimId);
     }
 
@@ -172,8 +198,8 @@ public final class EventService {
         if (!canManage(actor, venue)) {
             throw new IllegalArgumentException("You do not manage this venue's Garden claim.");
         }
-        if (hasAnyEvents(venue.id())) {
-            throw new IllegalArgumentException("This venue has event history and cannot be deleted in the current release.");
+        if (hasAnyEvents(venue.id()) || hasAnyVenueTickets(venue.id())) {
+            throw new IllegalArgumentException("This venue has ticket/event history and cannot be deleted in the current release.");
         }
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
@@ -181,6 +207,55 @@ public final class EventService {
             statement.setString(1, venue.id().toString());
             return statement.executeUpdate() > 0;
         }
+    }
+
+    public VenueRecord setVenueTicketing(Player actor, VenueRecord requested, boolean required, long price)
+            throws SQLException {
+        VenueRecord venue = findVenue(requested.id())
+                .orElseThrow(() -> new IllegalArgumentException("That venue no longer exists."));
+        if (!canManage(actor, venue)) {
+            throw new IllegalArgumentException("You do not manage this venue.");
+        }
+        if (price < 0) {
+            throw new IllegalArgumentException("Venue ticket price cannot be negative.");
+        }
+
+        long savedPrice = required ? price : venue.ticketPrice();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_venues SET ticket_required = ?, ticket_price = ? WHERE venue_uuid = ?")) {
+            statement.setInt(1, required ? 1 : 0);
+            statement.setLong(2, savedPrice);
+            statement.setString(3, venue.id().toString());
+            statement.executeUpdate();
+        }
+        return findVenue(venue.id()).orElseThrow();
+    }
+
+    public VenueRecord setVenueEntrance(Player actor, VenueRecord requested) throws SQLException {
+        VenueRecord venue = findVenue(requested.id())
+                .orElseThrow(() -> new IllegalArgumentException("That venue no longer exists."));
+        if (!canManage(actor, venue)) {
+            throw new IllegalArgumentException("You do not manage this venue.");
+        }
+        UUID claimId = land.claimIdAt(actor.getLocation().getBlock()).orElse(null);
+        if (claimId == null || !claimId.equals(venue.claimId())) {
+            throw new IllegalArgumentException("Stand inside this venue's registered claim to move its entrance.");
+        }
+
+        Location location = actor.getLocation();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_venues SET world_uuid = ?, world_name = ?, x = ?, y = ?, z = ? WHERE venue_uuid = ?")) {
+            statement.setString(1, location.getWorld().getUID().toString());
+            statement.setString(2, location.getWorld().getName());
+            statement.setDouble(3, location.getX());
+            statement.setDouble(4, location.getY());
+            statement.setDouble(5, location.getZ());
+            statement.setString(6, venue.id().toString());
+            statement.executeUpdate();
+        }
+        return findVenue(venue.id()).orElseThrow();
     }
 
     public EventRecord createEvent(
@@ -515,6 +590,85 @@ public final class EventService {
         }
     }
 
+    public VenueTicketRecord buyVenueTicket(Player buyer, VenueRecord requested) throws SQLException {
+        Object lock = purchaseLocks.computeIfAbsent(requested.id(), ignored -> new Object());
+        synchronized (lock) {
+            VenueRecord venue = findVenue(requested.id())
+                    .orElseThrow(() -> new IllegalArgumentException("That venue no longer exists."));
+            if (!venue.ticketRequired()) {
+                throw new IllegalArgumentException(venue.name() + " does not require permanent admission tickets.");
+            }
+            if (canManage(buyer, venue)) {
+                throw new IllegalArgumentException("You manage this venue and do not need a permanent admission ticket.");
+            }
+
+            GardenOrder order = platform.orders().create(
+                    OrderType.EVENT_TICKET,
+                    buyer.getUniqueId(),
+                    "PLAYER",
+                    venue.ownerId().toString(),
+                    venue.ticketPrice(),
+                    "gardenevents.venue-ticket",
+                    venue.id().toString(),
+                    "{\"venueUuid\":\"" + venue.id() + "\",\"permanentVenue\":true}"
+            );
+            platform.orders().transition(order.id(), OrderState.READY, "Permanent venue ticket validated");
+            platform.orders().transition(order.id(), OrderState.AWAITING_CONFIRMATION, "Buy command confirms venue ticket");
+            platform.orders().transition(order.id(), OrderState.PAYMENT_PENDING, "Collecting venue admission payment");
+
+            if (venue.ticketPrice() > 0) {
+                if (!platform.currency().withdraw(buyer.getUniqueId(), venue.ticketPrice())) {
+                    platform.orders().transition(order.id(), OrderState.PAYMENT_FAILED,
+                            "Buyer has insufficient Obols for venue admission");
+                    throw new IllegalArgumentException("You do not have enough Obols for this venue ticket.");
+                }
+                if (!platform.currency().deposit(venue.ownerId(), venue.ticketPrice())) {
+                    platform.currency().deposit(buyer.getUniqueId(), venue.ticketPrice());
+                    platform.orders().transition(order.id(), OrderState.PAYMENT_FAILED,
+                            "Venue owner payment failed and buyer was refunded");
+                    throw new IllegalArgumentException("The venue owner could not be paid. Your Obols were returned.");
+                }
+            }
+
+            platform.orders().transition(order.id(), OrderState.PAID,
+                    venue.ticketPrice() == 0 ? "Free venue ticket reserved" : "Venue ticket payment completed");
+            platform.orders().transition(order.id(), OrderState.FULFILLING, "Issuing physical venue ticket");
+
+            VenueTicketRecord ticket = new VenueTicketRecord(
+                    UUID.randomUUID(), venue.id(), buyer.getUniqueId(), order.id(),
+                    "VALID", venue.ticketPrice(), true, System.currentTimeMillis(), null
+            );
+            try {
+                insertVenueTicket(ticket);
+            } catch (SQLException exception) {
+                boolean reversed = reverseVenuePayment(venue, buyer);
+                safeTransition(order.id(),
+                        reversed ? OrderState.REFUNDED : OrderState.FULFILLMENT_FAILED,
+                        reversed
+                                ? "Venue ticket creation failed; payment reversed"
+                                : "Venue ticket creation failed and payment reversal needs admin review");
+                throw exception;
+            }
+
+            ItemStack item = venueTicketItem(ticket, venue);
+            Map<Integer, ItemStack> leftovers = buyer.getInventory().addItem(item);
+            leftovers.values().forEach(leftover ->
+                    buyer.getWorld().dropItemNaturally(buyer.getLocation(), leftover));
+
+            platform.orders().transition(order.id(), OrderState.COMPLETED, "Physical venue ticket issued");
+            publish(
+                    IntegrationEventType.TICKET_PURCHASED,
+                    "venue-ticket",
+                    ticket.id().toString(),
+                    "{\"venueUuid\":\"" + venue.id()
+                            + "\",\"buyerUuid\":\"" + buyer.getUniqueId()
+                            + "\",\"amount\":" + ticket.paidAmount()
+                            + ",\"permanentVenue\":true}"
+            );
+            return ticket;
+        }
+    }
+
     public List<EventRecord> startingEvents(long afterExclusive, long throughInclusive) throws SQLException {
         List<EventRecord> events = new ArrayList<>();
         try (Connection connection = platform.storage().connection();
@@ -533,6 +687,58 @@ public final class EventService {
 
     public boolean hasValidPhysicalTicket(Player player, UUID eventId) throws SQLException {
         return physicalTicket(player, eventId).isPresent();
+    }
+
+    public boolean hasValidPhysicalVenueTicket(Player player, UUID venueId) throws SQLException {
+        return physicalVenueTicket(player, venueId).isPresent();
+    }
+
+    public boolean wasAdmitted(Player player, UUID eventId) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT 1 FROM gev_tickets WHERE event_uuid = ? AND status = 'USED' "
+                             + "AND admitted_player_uuid = ? LIMIT 1")) {
+            statement.setString(1, eventId.toString());
+            statement.setString(2, player.getUniqueId().toString());
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        }
+    }
+
+    public Optional<EventRecord> eventAcceptingAdmissionAt(Player player) throws SQLException {
+        VenueRecord venue = venueAt(player).orElse(null);
+        return eventAcceptingAdmissionAt(venue);
+    }
+
+    public Optional<EventRecord> eventAcceptingAdmissionAt(VenueRecord venue) throws SQLException {
+        return venue == null
+                ? Optional.empty()
+                : eventInAdmissionWindow(venue.id(), System.currentTimeMillis());
+    }
+
+    public boolean canBypassAdmission(Player player, VenueRecord venue, EventRecord event) {
+        return player.hasPermission("gardenevents.admin")
+                || canManage(player, venue)
+                || (event != null && event.hostId().equals(player.getUniqueId()));
+    }
+
+    public void rememberAdmissionExit(Player player, Location exit) {
+        if (player == null || exit == null || exit.getWorld() == null) return;
+        pendingAdmissionExit.put(player.getUniqueId(), exit.clone());
+    }
+
+    public boolean declineAdmission(Player player) {
+        Location exit = pendingAdmissionExit.remove(player.getUniqueId());
+        return exit != null && player.teleport(exit);
+    }
+
+    public void clearPendingAdmission(Player player) {
+        if (player != null) pendingAdmissionExit.remove(player.getUniqueId());
+    }
+
+    public boolean hasPendingAdmission(Player player) {
+        return player != null && pendingAdmissionExit.containsKey(player.getUniqueId());
     }
 
     public Optional<EventRecord> admittableEventAt(Player player) throws SQLException {
@@ -560,16 +766,18 @@ public final class EventService {
 
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
-                     "UPDATE gev_tickets SET status = 'USED', used_at = ? "
+                     "UPDATE gev_tickets SET status = 'USED', used_at = ?, admitted_player_uuid = ? "
                              + "WHERE ticket_uuid = ? AND status = 'VALID'")) {
             statement.setLong(1, now);
-            statement.setString(2, physical.ticket().id().toString());
+            statement.setString(2, player.getUniqueId().toString());
+            statement.setString(3, physical.ticket().id().toString());
             if (statement.executeUpdate() != 1) {
                 throw new IllegalArgumentException("That ticket changed before admission could complete.");
             }
         }
 
         consumeTicket(player, physical);
+        clearPendingAdmission(player);
         publish(
                 IntegrationEventType.TICKET_ADMITTED,
                 "ticket",
@@ -579,6 +787,41 @@ public final class EventService {
                         + "\",\"venueUuid\":\"" + venue.id() + "\"}"
         );
         return new AdmissionResult(event, venue, physical.ticket());
+    }
+
+    public VenueAdmissionResult admitPermanentVenue(Player player) throws SQLException {
+        VenueRecord venue = venueAt(player)
+                .orElseThrow(() -> new IllegalArgumentException("Enter the registered venue before admitting your ticket."));
+        if (!venue.ticketRequired()) {
+            throw new IllegalArgumentException(venue.name() + " does not require a permanent admission ticket.");
+        }
+
+        VenueTicketPhysical physical = physicalVenueTicket(player, venue.id())
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "You do not have a valid permanent ticket for " + venue.name() + "."));
+        long now = System.currentTimeMillis();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_venue_tickets SET status = 'USED', used_at = ? "
+                             + "WHERE ticket_uuid = ? AND status = 'VALID'")) {
+            statement.setLong(1, now);
+            statement.setString(2, physical.ticket().id().toString());
+            if (statement.executeUpdate() != 1) {
+                throw new IllegalArgumentException("That venue ticket changed before admission could complete.");
+            }
+        }
+
+        consumeVenueTicket(player, physical);
+        clearPendingAdmission(player);
+        publish(
+                IntegrationEventType.TICKET_ADMITTED,
+                "venue-ticket",
+                physical.ticket().id().toString(),
+                "{\"venueUuid\":\"" + venue.id()
+                        + "\",\"playerUuid\":\"" + player.getUniqueId()
+                        + "\",\"permanentVenue\":true}"
+        );
+        return new VenueAdmissionResult(venue, physical.ticket());
     }
 
     private Optional<EventRecord> eventInAdmissionWindow(UUID venueId, long now) throws SQLException {
@@ -629,6 +872,46 @@ public final class EventService {
     private void consumeTicket(Player player, PhysicalTicket physical) {
         ItemStack item = player.getInventory().getItem(physical.slot());
         if (item == null || ticketId(item).filter(physical.ticket().id()::equals).isEmpty()) {
+            return;
+        }
+        if (item.getAmount() <= 1) {
+            player.getInventory().setItem(physical.slot(), null);
+        } else {
+            item.setAmount(item.getAmount() - 1);
+        }
+    }
+
+    private Optional<VenueTicketPhysical> physicalVenueTicket(Player player, UUID venueId) throws SQLException {
+        ItemStack[] contents = player.getInventory().getContents();
+        for (int slot = 0; slot < contents.length; slot++) {
+            ItemStack item = contents[slot];
+            if (item == null || item.getType() != Material.PAPER || !item.hasItemMeta()) {
+                continue;
+            }
+
+            String rawVenue = item.getItemMeta().getPersistentDataContainer()
+                    .get(venueKey, PersistentDataType.STRING);
+            if (rawVenue == null || !rawVenue.equals(venueId.toString())) {
+                continue;
+            }
+
+            UUID id = venueTicketId(item).orElse(null);
+            if (id == null) continue;
+            VenueTicketRecord ticket = findVenueTicket(id).orElse(null);
+            if (ticket == null || !ticket.valid() || !ticket.venueId().equals(venueId)) {
+                continue;
+            }
+            if (!ticket.transferable() && !ticket.ownerId().equals(player.getUniqueId())) {
+                continue;
+            }
+            return Optional.of(new VenueTicketPhysical(slot, item, ticket));
+        }
+        return Optional.empty();
+    }
+
+    private void consumeVenueTicket(Player player, VenueTicketPhysical physical) {
+        ItemStack item = player.getInventory().getItem(physical.slot());
+        if (item == null || venueTicketId(item).filter(physical.ticket().id()::equals).isEmpty()) {
             return;
         }
         if (item.getAmount() <= 1) {
@@ -891,6 +1174,34 @@ public final class EventService {
         }
     }
 
+    private Optional<VenueTicketRecord> findVenueTicket(UUID ticketId) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT * FROM gev_venue_tickets WHERE ticket_uuid = ? LIMIT 1")) {
+            statement.setString(1, ticketId.toString());
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? Optional.of(readVenueTicket(result)) : Optional.empty();
+            }
+        }
+    }
+
+    private void insertVenueTicket(VenueTicketRecord ticket) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "INSERT INTO gev_venue_tickets "
+                             + "(ticket_uuid, venue_uuid, owner_uuid, order_uuid, status, paid_amount, transferable, purchased_at, used_at) "
+                             + "VALUES (?, ?, ?, ?, 'VALID', ?, ?, ?, NULL)")) {
+            statement.setString(1, ticket.id().toString());
+            statement.setString(2, ticket.venueId().toString());
+            statement.setString(3, ticket.ownerId().toString());
+            statement.setString(4, ticket.orderId().toString());
+            statement.setLong(5, ticket.paidAmount());
+            statement.setInt(6, ticket.transferable() ? 1 : 0);
+            statement.setLong(7, ticket.purchasedAt());
+            statement.executeUpdate();
+        }
+    }
+
     private Optional<TicketRecord> findTicket(UUID ticketId) throws SQLException {
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
@@ -919,6 +1230,18 @@ public final class EventService {
         }
     }
 
+    private boolean reverseVenuePayment(VenueRecord venue, Player buyer) {
+        if (venue.ticketPrice() == 0) return true;
+        if (!platform.currency().withdraw(venue.ownerId(), venue.ticketPrice())) {
+            return false;
+        }
+        if (platform.currency().deposit(buyer.getUniqueId(), venue.ticketPrice())) {
+            return true;
+        }
+        platform.currency().deposit(venue.ownerId(), venue.ticketPrice());
+        return false;
+    }
+
     private boolean reversePayment(EventRecord event, Player buyer) {
         if (event.ticketPrice() == 0) return true;
         if (!platform.currency().withdraw(event.hostId(), event.ticketPrice())) {
@@ -931,6 +1254,102 @@ public final class EventService {
         return false;
     }
 
+    public boolean canManageVenue(Player actor, VenueRecord venue) {
+        return canManage(actor, venue);
+    }
+
+    public boolean canManageEvent(Player actor, EventRecord event) throws SQLException {
+        if (actor.hasPermission("gardenevents.admin")) return true;
+        if (event.hostId().equals(actor.getUniqueId())) return true;
+        return canManage(actor, venue(event));
+    }
+
+    public EventRecord setEventPrice(Player actor, EventRecord requested, long price) throws SQLException {
+        if (price < 0) throw new IllegalArgumentException("Ticket price cannot be negative.");
+        EventRecord event = managedScheduledEvent(actor, requested);
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_events SET ticket_price = ? WHERE event_uuid = ?")) {
+            statement.setLong(1, price);
+            statement.setString(2, event.id().toString());
+            statement.executeUpdate();
+        }
+        return findEvent(event.id()).orElseThrow();
+    }
+
+    public EventRecord setEventCapacity(Player actor, EventRecord requested, int capacity) throws SQLException {
+        EventRecord event = managedScheduledEvent(actor, requested);
+        if (capacity < 1 || capacity > maxCapacity) {
+            throw new IllegalArgumentException("Event capacity must be between 1 and " + maxCapacity + ".");
+        }
+        int sold = soldTickets(event.id());
+        if (capacity < sold) {
+            throw new IllegalArgumentException("Capacity cannot be lower than the " + sold + " tickets already issued.");
+        }
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_events SET capacity = ? WHERE event_uuid = ?")) {
+            statement.setInt(1, capacity);
+            statement.setString(2, event.id().toString());
+            statement.executeUpdate();
+        }
+        return findEvent(event.id()).orElseThrow();
+    }
+
+    public EventRecord rescheduleEvent(
+            Player actor, EventRecord requested, long startDelayMillis, long durationMillis) throws SQLException {
+        EventRecord event = managedScheduledEvent(actor, requested);
+        if (soldTickets(event.id()) > 0) {
+            throw new IllegalArgumentException(
+                    "An event cannot be rescheduled after tickets have been issued because the physical tickets show its start time.");
+        }
+        if (startDelayMillis < 60_000L || startDelayMillis > maxStartDelayMillis) {
+            throw new IllegalArgumentException("Event start time is outside the allowed scheduling window.");
+        }
+        if (durationMillis < 5L * 60_000L || durationMillis > maxDurationMillis) {
+            throw new IllegalArgumentException("Event duration is outside the allowed range.");
+        }
+
+        long startAt = Math.addExact(System.currentTimeMillis(), startDelayMillis);
+        long endAt = Math.addExact(startAt, durationMillis);
+        if (overlapsExcluding(event.venueId(), event.id(), startAt, endAt)) {
+            throw new IllegalArgumentException("That venue already has an overlapping scheduled event.");
+        }
+
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_events SET start_at = ?, end_at = ? WHERE event_uuid = ?")) {
+            statement.setLong(1, startAt);
+            statement.setLong(2, endAt);
+            statement.setString(3, event.id().toString());
+            statement.executeUpdate();
+        }
+        return findEvent(event.id()).orElseThrow();
+    }
+
+    private EventRecord managedScheduledEvent(Player actor, EventRecord requested) throws SQLException {
+        EventRecord event = findEvent(requested.id())
+                .orElseThrow(() -> new IllegalArgumentException("That event no longer exists."));
+        if (!event.scheduled()) throw new IllegalArgumentException("That event is no longer scheduled.");
+        if (!canManageEvent(actor, event)) throw new IllegalArgumentException("You do not manage this event.");
+        return event;
+    }
+
+    private boolean overlapsExcluding(UUID venueId, UUID eventId, long startAt, long endAt) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT 1 FROM gev_events WHERE venue_uuid = ? AND event_uuid <> ? "
+                             + "AND status = 'SCHEDULED' AND start_at < ? AND end_at > ? LIMIT 1")) {
+            statement.setString(1, venueId.toString());
+            statement.setString(2, eventId.toString());
+            statement.setLong(3, endAt);
+            statement.setLong(4, startAt);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        }
+    }
+
     private boolean overlaps(UUID venueId, long startAt, long endAt) throws SQLException {
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
@@ -939,6 +1358,17 @@ public final class EventService {
             statement.setString(1, venueId.toString());
             statement.setLong(2, endAt);
             statement.setLong(3, startAt);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        }
+    }
+
+    private boolean hasAnyVenueTickets(UUID venueId) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT 1 FROM gev_venue_tickets WHERE venue_uuid = ? LIMIT 1")) {
+            statement.setString(1, venueId.toString());
             try (ResultSet result = statement.executeQuery()) {
                 return result.next();
             }
@@ -983,7 +1413,7 @@ public final class EventService {
         meta.displayName(Component.text("Ticket • " + event.name(), NamedTextColor.WHITE));
         meta.lore(List.of(
                 Component.text("Venue: " + venue.name(), NamedTextColor.GRAY),
-                Component.text("Starts: " + Instant.ofEpochMilli(event.startAt()), NamedTextColor.GRAY),
+                Component.text("Starts: " + EventTime.format(event.startAt()), NamedTextColor.GRAY),
                 Component.text("Event " + event.id().toString().substring(0, 8), NamedTextColor.DARK_GRAY),
                 Component.text("Ticket " + ticket.id().toString().substring(0, 8), NamedTextColor.DARK_GRAY),
                 Component.text("Bearer ticket. One admission only.", NamedTextColor.DARK_GRAY)
@@ -992,6 +1422,36 @@ public final class EventService {
         meta.getPersistentDataContainer().set(eventKey, PersistentDataType.STRING, event.id().toString());
         item.setItemMeta(meta);
         return item;
+    }
+
+    private ItemStack venueTicketItem(VenueTicketRecord ticket, VenueRecord venue) {
+        ItemStack item = new ItemStack(Material.PAPER);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(Component.text("Ticket • " + venue.name(), NamedTextColor.WHITE));
+        meta.lore(List.of(
+                Component.text("Permanent venue admission", NamedTextColor.GRAY),
+                Component.text("Venue " + venue.id().toString().substring(0, 8), NamedTextColor.DARK_GRAY),
+                Component.text("Ticket " + ticket.id().toString().substring(0, 8), NamedTextColor.DARK_GRAY),
+                Component.text("Bearer ticket. One admission only.", NamedTextColor.DARK_GRAY)
+        ));
+        meta.getPersistentDataContainer().set(venueTicketKey, PersistentDataType.STRING, ticket.id().toString());
+        meta.getPersistentDataContainer().set(venueKey, PersistentDataType.STRING, venue.id().toString());
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private Optional<UUID> venueTicketId(ItemStack item) {
+        if (item == null || item.getType() != Material.PAPER || !item.hasItemMeta()) {
+            return Optional.empty();
+        }
+        String raw = item.getItemMeta().getPersistentDataContainer()
+                .get(venueTicketKey, PersistentDataType.STRING);
+        if (raw == null) return Optional.empty();
+        try {
+            return Optional.of(UUID.fromString(raw));
+        } catch (IllegalArgumentException ignored) {
+            return Optional.empty();
+        }
     }
 
     private ItemStack heldTicket(Player player) {
@@ -1060,6 +1520,8 @@ public final class EventService {
                 result.getDouble("x"),
                 result.getDouble("y"),
                 result.getDouble("z"),
+                result.getInt("ticket_required") != 0,
+                result.getLong("ticket_price"),
                 result.getLong("created_at")
         );
     }
@@ -1084,6 +1546,21 @@ public final class EventService {
         return new TicketRecord(
                 UUID.fromString(result.getString("ticket_uuid")),
                 UUID.fromString(result.getString("event_uuid")),
+                UUID.fromString(result.getString("owner_uuid")),
+                UUID.fromString(result.getString("order_uuid")),
+                result.getString("status"),
+                result.getLong("paid_amount"),
+                result.getInt("transferable") != 0,
+                result.getLong("purchased_at"),
+                usedAt == null ? null : result.getLong("used_at")
+        );
+    }
+
+    private VenueTicketRecord readVenueTicket(ResultSet result) throws SQLException {
+        Object usedAt = result.getObject("used_at");
+        return new VenueTicketRecord(
+                UUID.fromString(result.getString("ticket_uuid")),
+                UUID.fromString(result.getString("venue_uuid")),
                 UUID.fromString(result.getString("owner_uuid")),
                 UUID.fromString(result.getString("order_uuid")),
                 result.getString("status"),
@@ -1123,7 +1600,13 @@ public final class EventService {
     private record PhysicalTicket(int slot, ItemStack item, TicketRecord ticket) {
     }
 
+    private record VenueTicketPhysical(int slot, ItemStack item, VenueTicketRecord ticket) {
+    }
+
     public record AdmissionResult(EventRecord event, VenueRecord venue, TicketRecord ticket) {
+    }
+
+    public record VenueAdmissionResult(VenueRecord venue, VenueTicketRecord ticket) {
     }
 
     public record CancellationResult(EventRecord event, int refundedTickets, long refundTotal) {

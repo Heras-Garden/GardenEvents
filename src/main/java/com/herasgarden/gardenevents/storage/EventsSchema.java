@@ -24,7 +24,14 @@ public final class EventsSchema {
                     + "x DOUBLE NOT NULL,"
                     + "y DOUBLE NOT NULL,"
                     + "z DOUBLE NOT NULL,"
+                    + "ticket_required INTEGER NOT NULL DEFAULT 0,"
+                    + "ticket_price BIGINT NOT NULL DEFAULT 0,"
                     + "created_at BIGINT NOT NULL)");
+
+            ensureColumn(connection, "gev_venues", "ticket_required",
+                    "ALTER TABLE gev_venues ADD COLUMN ticket_required INTEGER NOT NULL DEFAULT 0");
+            ensureColumn(connection, "gev_venues", "ticket_price",
+                    "ALTER TABLE gev_venues ADD COLUMN ticket_price BIGINT NOT NULL DEFAULT 0");
 
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS gev_events ("
                     + "event_uuid VARCHAR(36) PRIMARY KEY,"
@@ -51,18 +58,36 @@ public final class EventsSchema {
                     + "paid_amount BIGINT NOT NULL DEFAULT 0,"
                     + "transferable INTEGER NOT NULL DEFAULT 1,"
                     + "purchased_at BIGINT NOT NULL,"
-                    + "used_at BIGINT NULL)");
+                    + "used_at BIGINT NULL,"
+                    + "admitted_player_uuid VARCHAR(36) NULL)");
 
             ensureColumn(connection, "gev_tickets", "paid_amount",
                     "ALTER TABLE gev_tickets ADD COLUMN paid_amount BIGINT NOT NULL DEFAULT 0");
             ensureColumn(connection, "gev_tickets", "transferable",
                     "ALTER TABLE gev_tickets ADD COLUMN transferable INTEGER NOT NULL DEFAULT 1");
+            ensureColumn(connection, "gev_tickets", "admitted_player_uuid",
+                    "ALTER TABLE gev_tickets ADD COLUMN admitted_player_uuid VARCHAR(36) NULL");
             dropLegacyOwnerIndex(statement);
 
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gev_ticket_owner_event_lookup "
                     + "ON gev_tickets (event_uuid, owner_uuid, status)");
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gev_ticket_event "
                     + "ON gev_tickets (event_uuid, status, purchased_at)");
+
+            statement.executeUpdate("CREATE TABLE IF NOT EXISTS gev_venue_tickets ("
+                    + "ticket_uuid VARCHAR(36) PRIMARY KEY,"
+                    + "venue_uuid VARCHAR(36) NOT NULL,"
+                    + "owner_uuid VARCHAR(36) NOT NULL,"
+                    + "order_uuid VARCHAR(36) NOT NULL,"
+                    + "status VARCHAR(24) NOT NULL,"
+                    + "paid_amount BIGINT NOT NULL DEFAULT 0,"
+                    + "transferable INTEGER NOT NULL DEFAULT 1,"
+                    + "purchased_at BIGINT NOT NULL,"
+                    + "used_at BIGINT NULL)");
+            statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gev_venue_ticket_owner "
+                    + "ON gev_venue_tickets (venue_uuid, owner_uuid, status)");
+            statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gev_venue_ticket_venue "
+                    + "ON gev_venue_tickets (venue_uuid, status, purchased_at)");
         }
     }
 

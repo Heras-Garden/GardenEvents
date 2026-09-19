@@ -2,6 +2,7 @@ package com.herasgarden.gardenevents.command;
 
 import com.herasgarden.gardencore.api.ui.GardenMessages;
 import com.herasgarden.gardenevents.EventService;
+import com.herasgarden.gardenevents.EventTime;
 import com.herasgarden.gardenevents.EventService.AdmissionResult;
 import com.herasgarden.gardenevents.EventService.CancellationResult;
 import com.herasgarden.gardenevents.model.EventRecord;
@@ -19,7 +20,6 @@ import org.bukkit.entity.Player;
 
 import java.sql.SQLException;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
@@ -53,7 +53,11 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
                 case "buy" -> buy(player, args);
                 case "issue" -> issue(player, args);
                 case "admit" -> admit(player);
-                case "later" -> GardenMessages.send(player, "Admission skipped for now.");
+                case "later" -> later(player);
+                case "settings" -> settings(player, args);
+                case "setprice" -> setPrice(player, args);
+                case "setcapacity" -> setCapacity(player, args);
+                case "reschedule" -> reschedule(player, args);
                 case "cancel" -> cancel(player, args);
                 default -> usage(player);
             }
@@ -89,8 +93,9 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
 
         EventRecord event = events.createEvent(player, venueKey, startIn, duration, price, capacity, name);
         GardenMessages.send(player, "Event created: " + event.name() + ".");
-        GardenMessages.send(player, "Starts " + Instant.ofEpochMilli(event.startAt())
-                + " | Ticket: ⟡ " + event.ticketPrice() + ".");
+        GardenMessages.send(player, "Starts: " + EventTime.format(event.startAt())
+                + " | Ends: " + EventTime.format(event.endAt()) + ".");
+        GardenMessages.send(player, "Ticket: ⟡ " + event.ticketPrice() + ".");
     }
 
     private void list(Player player) throws SQLException {
@@ -109,6 +114,7 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
                             .clickEvent(ClickEvent.runCommand("/event info " + event.name()))
                             .hoverEvent(HoverEvent.showText(Component.text("View event details"))))
                     .append(Component.text(" @ " + venue.name(), NamedTextColor.GRAY))
+                    .append(Component.text(" | " + EventTime.format(event.startAt()), NamedTextColor.GRAY))
                     .append(Component.text(" | " + sold + "/" + event.capacity(), NamedTextColor.GRAY))
                     .append(Component.text(" | ⟡ " + event.ticketPrice(), NamedTextColor.GRAY))
                     .append(Component.text("  "))
@@ -126,8 +132,8 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
         VenueRecord venue = events.venue(event);
         int sold = events.soldTickets(event.id());
         GardenMessages.send(player, event.name() + " @ " + venue.name() + ".");
-        GardenMessages.send(player, "Starts: " + Instant.ofEpochMilli(event.startAt())
-                + " | Ends: " + Instant.ofEpochMilli(event.endAt()) + ".");
+        GardenMessages.send(player, "Starts: " + EventTime.format(event.startAt())
+                + " | Ends: " + EventTime.format(event.endAt()) + ".");
         GardenMessages.send(player, "Tickets: " + sold + "/" + event.capacity()
                 + " | Price: ⟡ " + event.ticketPrice()
                 + " | Status: " + event.status() + ".");
@@ -188,6 +194,79 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
     private void admit(Player player) throws SQLException {
         AdmissionResult result = events.admit(player);
         GardenMessages.send(player, "Ticket accepted. Welcome to " + result.event().name() + ".");
+    }
+
+    private void later(Player player) {
+        if (events.declineAdmission(player)) {
+            GardenMessages.send(player, "Admission skipped. Your ticket was not used.");
+        } else {
+            GardenMessages.send(player, "There is no pending admission to decline.");
+        }
+    }
+
+    private void settings(Player player, String[] args) throws SQLException {
+        EventRecord event = requireEvent(args, 1, args.length);
+        if (!events.canManageEvent(player, event)) {
+            throw new IllegalArgumentException("You do not manage this event.");
+        }
+        VenueRecord venue = events.venue(event);
+        int sold = events.soldTickets(event.id());
+        String code = shortId(event);
+
+        GardenMessages.send(player, "Event settings: " + event.name() + " @ " + venue.name() + ".");
+        GardenMessages.send(player, "Starts: " + EventTime.format(event.startAt())
+                + " | Ends: " + EventTime.format(event.endAt()) + ".");
+        GardenMessages.send(player, "Price: ⟡ " + event.ticketPrice()
+                + " | Capacity: " + sold + "/" + event.capacity() + ".");
+
+        Component controls = GardenMessages.prefix()
+                .append(Component.text("[Make Free]", NamedTextColor.GREEN)
+                        .clickEvent(ClickEvent.runCommand("/event setprice 0 " + code))
+                        .hoverEvent(HoverEvent.showText(Component.text("Set future ticket purchases to free"))))
+                .append(Component.space())
+                .append(Component.text("[Info]", NamedTextColor.AQUA)
+                        .clickEvent(ClickEvent.runCommand("/event info " + code)));
+        player.sendMessage(controls);
+        GardenMessages.send(player, "Change price with /event setprice <obols> " + code + ".");
+        GardenMessages.send(player, "Change capacity with /event setcapacity <amount> " + code + ".");
+        GardenMessages.send(player,
+                "Before any tickets are issued, reschedule with /event reschedule <start-in> <duration> " + code + ".");
+    }
+
+    private void setPrice(Player player, String[] args) throws SQLException {
+        if (args.length < 3) {
+            throw new IllegalArgumentException("Use /event setprice <obols> <event>.");
+        }
+        long price = parseNonNegative(args[1], "Ticket price");
+        EventRecord event = requireEvent(args, 2, args.length);
+        EventRecord updated = events.setEventPrice(player, event, price);
+        GardenMessages.send(player, "Ticket price for " + updated.name() + " set to ⟡ "
+                + updated.ticketPrice() + ".");
+    }
+
+    private void setCapacity(Player player, String[] args) throws SQLException {
+        if (args.length < 3) {
+            throw new IllegalArgumentException("Use /event setcapacity <amount> <event>.");
+        }
+        int capacity = Integer.parseInt(args[1].replace(",", ""));
+        EventRecord event = requireEvent(args, 2, args.length);
+        EventRecord updated = events.setEventCapacity(player, event, capacity);
+        GardenMessages.send(player, "Capacity for " + updated.name() + " set to "
+                + updated.capacity() + ".");
+    }
+
+    private void reschedule(Player player, String[] args) throws SQLException {
+        if (args.length < 4) {
+            throw new IllegalArgumentException(
+                    "Use /event reschedule <start-in> <duration> <event>.");
+        }
+        long startIn = parseDuration(args[1]);
+        long duration = parseDuration(args[2]);
+        EventRecord event = requireEvent(args, 3, args.length);
+        EventRecord updated = events.rescheduleEvent(player, event, startIn, duration);
+        GardenMessages.send(player, "Rescheduled " + updated.name() + ".");
+        GardenMessages.send(player, "Starts: " + EventTime.format(updated.startAt())
+                + " | Ends: " + EventTime.format(updated.endAt()) + ".");
     }
 
     private void cancel(Player player, String[] args) throws SQLException {
@@ -266,13 +345,17 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
     private void usage(Player player) {
         GardenMessages.send(player,
                 "/event create <venue-key> <start-in> <duration> <price> <capacity> <name>, "
-                        + "list, info <event>, buy <event> [amount], issue <amount> <event>, admit, later, cancel <event>");
+                        + "list, info <event>, buy <event> [amount], issue <amount> <event>, admit, later, "
+                        + "settings <event>, setprice <obols> <event>, setcapacity <amount> <event>, "
+                        + "reschedule <start-in> <duration> <event>, cancel <event>");
     }
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (args.length == 1) {
-            return match(args[0], List.of("create", "list", "info", "buy", "issue", "admit", "later", "cancel"));
+            return match(args[0], List.of(
+                    "create", "list", "info", "buy", "issue", "admit", "later",
+                    "settings", "setprice", "setcapacity", "reschedule", "cancel"));
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("create")) {
             try {
@@ -284,6 +367,7 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
         if (args.length == 2
                 && (args[0].equalsIgnoreCase("info")
                 || args[0].equalsIgnoreCase("buy")
+                || args[0].equalsIgnoreCase("settings")
                 || args[0].equalsIgnoreCase("cancel"))) {
             try {
                 return match(args[1], events.upcomingEvents().stream().map(EventRecord::name).toList());
