@@ -724,6 +724,10 @@ public final class EventService {
         if (player != null) pendingAdmissionExit.remove(player.getUniqueId());
     }
 
+    public boolean hasPendingAdmission(Player player) {
+        return player != null && pendingAdmissionExit.containsKey(player.getUniqueId());
+    }
+
     public Optional<EventRecord> admittableEventAt(Player player) throws SQLException {
         VenueRecord venue = venueAt(player).orElse(null);
         if (venue == null) {
