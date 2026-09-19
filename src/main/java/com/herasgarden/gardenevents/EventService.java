@@ -695,6 +695,10 @@ public final class EventService {
 
     public Optional<EventRecord> eventAcceptingAdmissionAt(Player player) throws SQLException {
         VenueRecord venue = venueAt(player).orElse(null);
+        return eventAcceptingAdmissionAt(venue);
+    }
+
+    public Optional<EventRecord> eventAcceptingAdmissionAt(VenueRecord venue) throws SQLException {
         return venue == null
                 ? Optional.empty()
                 : eventInAdmissionWindow(venue.id(), System.currentTimeMillis());
