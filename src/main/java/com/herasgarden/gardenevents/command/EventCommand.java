@@ -53,6 +53,7 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
                 case "buy" -> buy(player, args);
                 case "issue" -> issue(player, args);
                 case "admit" -> admit(player);
+                case "later" -> GardenMessages.send(player, "Admission skipped for now.");
                 case "cancel" -> cancel(player, args);
                 default -> usage(player);
             }
@@ -103,21 +104,19 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
         for (EventRecord event : upcoming) {
             VenueRecord venue = events.venue(event);
             int sold = events.soldTickets(event.id());
-            String id = shortId(event);
-
             Component row = GardenMessages.prefix()
                     .append(Component.text(event.name(), NamedTextColor.WHITE)
-                            .clickEvent(ClickEvent.runCommand("/event info " + id))
+                            .clickEvent(ClickEvent.runCommand("/event info " + event.name()))
                             .hoverEvent(HoverEvent.showText(Component.text("View event details"))))
                     .append(Component.text(" @ " + venue.name(), NamedTextColor.GRAY))
                     .append(Component.text(" | " + sold + "/" + event.capacity(), NamedTextColor.GRAY))
                     .append(Component.text(" | ⟡ " + event.ticketPrice(), NamedTextColor.GRAY))
                     .append(Component.text("  "))
                     .append(Component.text("[Info]", NamedTextColor.AQUA)
-                            .clickEvent(ClickEvent.runCommand("/event info " + id)))
+                            .clickEvent(ClickEvent.runCommand("/event info " + event.name())))
                     .append(Component.text(" "))
                     .append(Component.text("[Buy]", NamedTextColor.GREEN)
-                            .clickEvent(ClickEvent.runCommand("/event buy " + id)));
+                            .clickEvent(ClickEvent.runCommand("/event buy " + event.name())));
             player.sendMessage(row);
         }
     }
@@ -163,12 +162,24 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
             GardenMessages.send(player, "You do not have permission to issue event tickets.");
             return;
         }
-        if (args.length < 3) {
-            throw new IllegalArgumentException("Use /event issue <amount> <event title>.");
+        if (args.length < 2) {
+            throw new IllegalArgumentException(
+                    "Use /event issue <amount> <event title> or /event issue <event title> [amount].");
         }
 
-        int amount = Integer.parseInt(args[1]);
-        EventRecord event = requireEvent(args, 2, args.length);
+        int amount = 1;
+        int eventStart = 1;
+        int eventEnd = args.length;
+
+        if (isInteger(args[1])) {
+            amount = Integer.parseInt(args[1]);
+            eventStart = 2;
+        } else if (args.length >= 3 && isInteger(args[args.length - 1])) {
+            amount = Integer.parseInt(args[args.length - 1]);
+            eventEnd--;
+        }
+
+        EventRecord event = requireEvent(args, eventStart, eventEnd);
         List<TicketRecord> tickets = events.issueHostTickets(player, event, amount);
         GardenMessages.send(player, "Issued " + tickets.size() + " giveaway ticket"
                 + (tickets.size() == 1 ? "" : "s") + " for " + event.name() + ".");
@@ -255,13 +266,13 @@ public final class EventCommand implements CommandExecutor, TabCompleter {
     private void usage(Player player) {
         GardenMessages.send(player,
                 "/event create <venue-key> <start-in> <duration> <price> <capacity> <name>, "
-                        + "list, info <event>, buy <event> [amount], issue <amount> <event>, admit, cancel <event>");
+                        + "list, info <event>, buy <event> [amount], issue <amount> <event>, admit, later, cancel <event>");
     }
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (args.length == 1) {
-            return match(args[0], List.of("create", "list", "info", "buy", "issue", "admit", "cancel"));
+            return match(args[0], List.of("create", "list", "info", "buy", "issue", "admit", "later", "cancel"));
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("create")) {
             try {

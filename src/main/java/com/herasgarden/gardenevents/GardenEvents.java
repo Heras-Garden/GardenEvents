@@ -6,6 +6,7 @@ import com.herasgarden.gardencore.api.ui.GardenMessages;
 import com.herasgarden.gardenevents.command.EventCommand;
 import com.herasgarden.gardenevents.command.VenueCommand;
 import com.herasgarden.gardenevents.model.EventRecord;
+import com.herasgarden.gardenevents.model.VenueRecord;
 import com.herasgarden.gardenevents.storage.EventsSchema;
 import org.bukkit.Sound;
 import org.bukkit.command.PluginCommand;
@@ -17,6 +18,8 @@ import java.sql.SQLException;
 import java.util.List;
 
 public final class GardenEvents extends JavaPlugin {
+    private static final long TEN_MINUTES = 10L * 60L * 1000L;
+
     private EventService events;
     private long lastStartCheck;
 
@@ -66,6 +69,8 @@ public final class GardenEvents extends JavaPlugin {
             event.setTabCompleter(eventCommand);
         }
 
+        getServer().getPluginManager().registerEvents(new VenueAdmissionListener(events), this);
+
         lastStartCheck = System.currentTimeMillis();
         getServer().getScheduler().runTaskTimer(this, this::announceEventStarts, 20L, 20L);
 
@@ -78,18 +83,41 @@ public final class GardenEvents extends JavaPlugin {
         lastStartCheck = now;
 
         try {
+            List<EventRecord> tenMinuteWarnings = events.startingEvents(
+                    previous + TEN_MINUTES,
+                    now + TEN_MINUTES
+            );
+            for (EventRecord event : tenMinuteWarnings) {
+                VenueRecord venue = events.venue(event);
+                for (Player player : getServer().getOnlinePlayers()) {
+                    GardenMessages.send(
+                            player,
+                            event.name() + " at " + venue.name() + " starts in 10 minutes."
+                    );
+                }
+            }
+
             List<EventRecord> starting = events.startingEvents(previous, now);
             for (EventRecord event : starting) {
+                VenueRecord venue = events.venue(event);
                 for (Player player : getServer().getOnlinePlayers()) {
                     if (!events.hasValidPhysicalTicket(player, event.id())) {
                         continue;
                     }
-                    player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_CHIME, 1.0f, 1.0f);
-                    GardenMessages.send(player, event.name() + " is starting now.");
+                    player.playSound(
+                            player.getLocation(),
+                            Sound.BLOCK_NOTE_BLOCK_CHIME,
+                            1.0f,
+                            1.0f
+                    );
+                    GardenMessages.send(
+                            player,
+                            "Event started: " + event.name() + " at " + venue.name() + "."
+                    );
                 }
             }
         } catch (SQLException exception) {
-            getLogger().warning("Could not check for starting events: " + exception.getMessage());
+            getLogger().warning("Could not check event announcements: " + exception.getMessage());
         }
     }
 

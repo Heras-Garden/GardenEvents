@@ -494,6 +494,8 @@ public final class EventService {
                                 + "\",\"hostIssued\":true}"
                 );
                 platform.orders().transition(order.id(), OrderState.READY, "Host giveaway ticket approved");
+                platform.orders().transition(order.id(), OrderState.AWAITING_CONFIRMATION, "Host confirmed giveaway ticket");
+                platform.orders().transition(order.id(), OrderState.PAYMENT_PENDING, "No payment required");
                 platform.orders().transition(order.id(), OrderState.PAID, "No payment required");
                 platform.orders().transition(order.id(), OrderState.FULFILLING, "Issuing host giveaway ticket");
 
@@ -530,82 +532,110 @@ public final class EventService {
     }
 
     public boolean hasValidPhysicalTicket(Player player, UUID eventId) throws SQLException {
-        for (ItemStack item : player.getInventory().getContents()) {
-            if (item == null || item.getType() != Material.PAPER || !item.hasItemMeta()) {
-                continue;
-            }
-            String rawEvent = item.getItemMeta().getPersistentDataContainer().get(eventKey, PersistentDataType.STRING);
-            if (rawEvent == null || !rawEvent.equals(eventId.toString())) {
-                continue;
-            }
-            UUID id = ticketId(item).orElse(null);
-            if (id == null) {
-                continue;
-            }
-            TicketRecord ticket = findTicket(id).orElse(null);
-            if (ticket != null && ticket.valid() && ticket.eventId().equals(eventId)) {
-                return true;
-            }
+        return physicalTicket(player, eventId).isPresent();
+    }
+
+    public Optional<EventRecord> admittableEventAt(Player player) throws SQLException {
+        VenueRecord venue = venueAt(player).orElse(null);
+        if (venue == null) {
+            return Optional.empty();
         }
-        return false;
+
+        EventRecord event = eventInAdmissionWindow(venue.id(), System.currentTimeMillis()).orElse(null);
+        if (event == null || physicalTicket(player, event.id()).isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(event);
     }
 
     public AdmissionResult admit(Player player) throws SQLException {
-        ItemStack item = heldTicket(player);
-        if (item == null) {
-            throw new IllegalArgumentException("Hold your Garden event ticket in your main or off hand.");
-        }
-        UUID ticketId = ticketId(item)
-                .orElseThrow(() -> new IllegalArgumentException("That item is not a valid Garden event ticket."));
-        TicketRecord ticket = findTicket(ticketId)
-                .orElseThrow(() -> new IllegalArgumentException("That ticket does not exist."));
-        if (!ticket.valid()) {
-            throw new IllegalArgumentException("That ticket has already been used or cancelled.");
-        }
-        if (!ticket.transferable() && !ticket.ownerId().equals(player.getUniqueId())) {
-            throw new IllegalArgumentException("That ticket belongs to another player.");
-        }
-
-        EventRecord event = findEvent(ticket.eventId())
-                .orElseThrow(() -> new IllegalArgumentException("That ticket's event no longer exists."));
-        if (!event.scheduled()) {
-            throw new IllegalArgumentException("That event is not active.");
-        }
-        VenueRecord venue = venue(event);
-        if (!atVenueEntrance(player, venue)) {
-            throw new IllegalArgumentException("Go to the registered entrance for " + venue.name() + " to use this ticket.");
-        }
-
+        VenueRecord venue = venueAt(player)
+                .orElseThrow(() -> new IllegalArgumentException("Enter the registered venue before admitting your ticket."));
         long now = System.currentTimeMillis();
-        if (now < event.startAt() - admissionEarlyMillis) {
-            throw new IllegalArgumentException("Admission is not open yet.");
-        }
-        if (now > event.endAt() + admissionLateMillis) {
-            throw new IllegalArgumentException("Admission for this event has closed.");
-        }
+        EventRecord event = eventInAdmissionWindow(venue.id(), now)
+                .orElseThrow(() -> new IllegalArgumentException("There is no event accepting admission at this venue right now."));
+
+        PhysicalTicket physical = physicalTicket(player, event.id())
+                .orElseThrow(() -> new IllegalArgumentException("You do not have a valid ticket for " + event.name() + "."));
 
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
                      "UPDATE gev_tickets SET status = 'USED', used_at = ? "
-                             + "WHERE ticket_uuid = ? AND owner_uuid = ? AND status = 'VALID'")) {
+                             + "WHERE ticket_uuid = ? AND status = 'VALID'")) {
             statement.setLong(1, now);
-            statement.setString(2, ticket.id().toString());
-            statement.setString(3, player.getUniqueId().toString());
+            statement.setString(2, physical.ticket().id().toString());
             if (statement.executeUpdate() != 1) {
                 throw new IllegalArgumentException("That ticket changed before admission could complete.");
             }
         }
 
-        consumeHeldTicket(player, item);
+        consumeTicket(player, physical);
         publish(
                 IntegrationEventType.TICKET_ADMITTED,
                 "ticket",
-                ticket.id().toString(),
+                physical.ticket().id().toString(),
                 "{\"eventUuid\":\"" + event.id()
                         + "\",\"playerUuid\":\"" + player.getUniqueId()
                         + "\",\"venueUuid\":\"" + venue.id() + "\"}"
         );
-        return new AdmissionResult(event, venue, ticket);
+        return new AdmissionResult(event, venue, physical.ticket());
+    }
+
+    private Optional<EventRecord> eventInAdmissionWindow(UUID venueId, long now) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT * FROM gev_events WHERE venue_uuid = ? AND status = 'SCHEDULED' "
+                             + "AND start_at <= ? AND end_at >= ? ORDER BY start_at ASC LIMIT 1")) {
+            statement.setString(1, venueId.toString());
+            statement.setLong(2, now + admissionEarlyMillis);
+            statement.setLong(3, now - admissionLateMillis);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? Optional.of(readEvent(result)) : Optional.empty();
+            }
+        }
+    }
+
+    private Optional<PhysicalTicket> physicalTicket(Player player, UUID eventId) throws SQLException {
+        ItemStack[] contents = player.getInventory().getContents();
+        for (int slot = 0; slot < contents.length; slot++) {
+            ItemStack item = contents[slot];
+            if (item == null || item.getType() != Material.PAPER || !item.hasItemMeta()) {
+                continue;
+            }
+
+            String rawEvent = item.getItemMeta().getPersistentDataContainer()
+                    .get(eventKey, PersistentDataType.STRING);
+            if (rawEvent == null || !rawEvent.equals(eventId.toString())) {
+                continue;
+            }
+
+            UUID id = ticketId(item).orElse(null);
+            if (id == null) {
+                continue;
+            }
+
+            TicketRecord ticket = findTicket(id).orElse(null);
+            if (ticket == null || !ticket.valid() || !ticket.eventId().equals(eventId)) {
+                continue;
+            }
+            if (!ticket.transferable() && !ticket.ownerId().equals(player.getUniqueId())) {
+                continue;
+            }
+            return Optional.of(new PhysicalTicket(slot, item, ticket));
+        }
+        return Optional.empty();
+    }
+
+    private void consumeTicket(Player player, PhysicalTicket physical) {
+        ItemStack item = player.getInventory().getItem(physical.slot());
+        if (item == null || ticketId(item).filter(physical.ticket().id()::equals).isEmpty()) {
+            return;
+        }
+        if (item.getAmount() <= 1) {
+            player.getInventory().setItem(physical.slot(), null);
+        } else {
+            item.setAmount(item.getAmount() - 1);
+        }
     }
 
     public CancellationResult cancel(Player actor, EventRecord requested) throws SQLException {
@@ -1088,6 +1118,9 @@ public final class EventService {
                 .replace("\"", "\\\"")
                 .replace("\n", "\\n")
                 .replace("\r", "\\r");
+    }
+
+    private record PhysicalTicket(int slot, ItemStack item, TicketRecord ticket) {
     }
 
     public record AdmissionResult(EventRecord event, VenueRecord venue, TicketRecord ticket) {
