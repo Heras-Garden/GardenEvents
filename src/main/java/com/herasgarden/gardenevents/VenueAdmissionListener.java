@@ -56,7 +56,7 @@ public final class VenueAdmissionListener implements Listener {
                 return;
             }
 
-            EventRecord active = events.eventAcceptingAdmissionAt(player).orElse(null);
+            EventRecord active = events.eventAcceptingAdmissionAt(venue).orElse(null);
             if (active != null) {
                 if (events.canBypassAdmission(player, venue, active)) {
                     lastVenue.put(player.getUniqueId(), venue.id());
