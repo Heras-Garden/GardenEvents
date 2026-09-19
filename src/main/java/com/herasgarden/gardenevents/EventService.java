@@ -174,7 +174,12 @@ public final class EventService {
     }
 
     public Optional<VenueRecord> venueAt(Player player) throws SQLException {
-        UUID claimId = land.claimIdAt(player.getLocation().getBlock()).orElse(null);
+        return venueAt(player.getLocation());
+    }
+
+    public Optional<VenueRecord> venueAt(Location location) throws SQLException {
+        if (location == null || location.getWorld() == null) return Optional.empty();
+        UUID claimId = land.claimIdAt(location.getBlock()).orElse(null);
         return claimId == null ? Optional.empty() : venueForClaim(claimId);
     }
 
