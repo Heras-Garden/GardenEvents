@@ -47,6 +47,9 @@ public final class VenueAdmissionListener implements Listener {
                 return;
             }
             if (venue.id().equals(previous)) {
+                if (events.hasPendingAdmission(player)) {
+                    event.setTo(event.getFrom());
+                }
                 return;
             }
 
