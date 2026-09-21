@@ -13,7 +13,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 
-import java.sql.SQLException;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -36,9 +35,8 @@ public final class VenueAdmissionListener implements Listener {
         }
 
         Player player = event.getPlayer();
-        try {
-            VenueRecord fromVenue = events.venueAt(event.getFrom()).orElse(null);
-            VenueRecord venue = events.venueAt(event.getTo()).orElse(null);
+        VenueRecord fromVenue = events.venueAtCached(event.getFrom()).orElse(null);
+        VenueRecord venue = events.venueAtCached(event.getTo()).orElse(null);
             UUID previous = lastVenue.get(player.getUniqueId());
 
             if (venue == null) {
@@ -59,13 +57,13 @@ public final class VenueAdmissionListener implements Listener {
                 return;
             }
 
-            EventRecord active = events.eventAcceptingAdmissionAt(venue).orElse(null);
+            EventRecord active = events.eventAcceptingAdmissionAtCached(venue).orElse(null);
             if (active != null) {
                 if (events.canBypassAdmission(player, venue, active)) {
                     lastVenue.put(player.getUniqueId(), venue.id());
                     return;
                 }
-                if (!events.hasValidPhysicalTicket(player, active.id())) {
+                if (!events.hasValidPhysicalTicketCached(player, active.id())) {
                     blockEntry(event);
                     lastVenue.remove(player.getUniqueId());
                     events.clearPendingAdmission(player);
@@ -86,7 +84,7 @@ public final class VenueAdmissionListener implements Listener {
                     lastVenue.put(player.getUniqueId(), venue.id());
                     return;
                 }
-                if (!events.hasValidPhysicalVenueTicket(player, venue.id())) {
+                if (!events.hasValidPhysicalVenueTicketCached(player, venue.id())) {
                     blockEntry(event);
                     lastVenue.remove(player.getUniqueId());
                     events.clearPendingAdmission(player);
@@ -102,12 +100,6 @@ public final class VenueAdmissionListener implements Listener {
             }
 
             lastVenue.put(player.getUniqueId(), venue.id());
-        } catch (SQLException exception) {
-            blockEntry(event);
-            lastVenue.remove(player.getUniqueId());
-            events.clearPendingAdmission(player);
-            GardenMessages.send(player, "Venue admission could not be checked right now. Please try again.");
-        }
     }
 
     private void blockEntry(PlayerMoveEvent event) {

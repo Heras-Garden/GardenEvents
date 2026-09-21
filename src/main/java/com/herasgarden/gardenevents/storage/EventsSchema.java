@@ -3,6 +3,7 @@ package com.herasgarden.gardenevents.storage;
 import com.herasgarden.gardencore.api.storage.GardenStorage;
 
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -102,15 +103,22 @@ public final class EventsSchema {
         }
     }
 
-    private static void dropLegacyOwnerIndex(Statement statement) {
-        try {
-            statement.executeUpdate("DROP INDEX IF EXISTS idx_gev_ticket_owner_event");
+    private static void dropLegacyOwnerIndex(Statement statement) throws SQLException {
+        Connection connection = statement.getConnection();
+        if (!indexExists(connection, "gev_tickets", "idx_gev_ticket_owner_event")) {
             return;
-        } catch (SQLException ignored) {
         }
-        try {
-            statement.executeUpdate("DROP INDEX idx_gev_ticket_owner_event ON gev_tickets");
-        } catch (SQLException ignored) {
+        statement.executeUpdate("DROP INDEX idx_gev_ticket_owner_event ON gev_tickets");
+    }
+
+    private static boolean indexExists(Connection connection, String table, String index) throws SQLException {
+        DatabaseMetaData meta = connection.getMetaData();
+        try (ResultSet result = meta.getIndexInfo(null, null, table, false, false)) {
+            while (result.next()) {
+                String name = result.getString("INDEX_NAME");
+                if (name != null && name.equalsIgnoreCase(index)) return true;
+            }
         }
+        return false;
     }
 }

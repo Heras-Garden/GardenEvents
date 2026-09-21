@@ -8,7 +8,7 @@ import java.util.Locale;
 public final class EventTime {
     private static final ZoneId EASTERN = ZoneId.of("America/New_York");
     private static final DateTimeFormatter FORMATTER =
-            DateTimeFormatter.ofPattern("M/d/yyyy h:mma z", Locale.US).withZone(EASTERN);
+            DateTimeFormatter.ofPattern("M/d/yyyy 'at' h:mm a", Locale.US).withZone(EASTERN);
 
     private EventTime() {
     }

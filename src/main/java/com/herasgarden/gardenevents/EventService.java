@@ -32,7 +32,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -53,6 +56,10 @@ public final class EventService {
     private final NamespacedKey venueKey;
     private final Map<UUID, Object> purchaseLocks = new ConcurrentHashMap<>();
     private final Map<UUID, Location> pendingAdmissionExit = new ConcurrentHashMap<>();
+    private volatile Map<UUID, VenueRecord> cachedVenuesByClaim = Map.of();
+    private volatile Map<UUID, EventRecord> cachedAdmissionEventsByVenue = Map.of();
+    private volatile Map<UUID, TicketAccess> cachedValidTickets = Map.of();
+    private volatile Map<UUID, VenueTicketAccess> cachedValidVenueTickets = Map.of();
 
     public EventService(
             JavaPlugin plugin,
@@ -517,19 +524,24 @@ public final class EventService {
         }
     }
 
-    public List<TicketRecord> buyTickets(Player buyer, EventRecord event, int amount) throws SQLException {
+    public List<TicketRecord> buyTickets(Player buyer, EventRecord requested, int amount) throws SQLException {
         if (amount < 1 || amount > 64) {
             throw new IllegalArgumentException("Ticket amount must be between 1 and 64.");
         }
-        if (soldTickets(event.id()) + amount > event.capacity()) {
-            throw new IllegalArgumentException("There are not enough tickets left for that purchase.");
-        }
+        Object lock = purchaseLocks.computeIfAbsent(requested.id(), ignored -> new Object());
+        synchronized (lock) {
+            EventRecord event = findEvent(requested.id())
+                    .orElseThrow(() -> new IllegalArgumentException("That event no longer exists."));
+            if (soldTickets(event.id()) + amount > event.capacity()) {
+                throw new IllegalArgumentException("There are not enough tickets left for that purchase.");
+            }
 
-        List<TicketRecord> tickets = new ArrayList<>();
-        for (int i = 0; i < amount; i++) {
-            tickets.add(buyTicket(buyer, event));
+            List<TicketRecord> tickets = new ArrayList<>();
+            for (int i = 0; i < amount; i++) {
+                tickets.add(buyTicket(buyer, event));
+            }
+            return List.copyOf(tickets);
         }
-        return List.copyOf(tickets);
     }
 
     public List<TicketRecord> issueHostTickets(Player actor, EventRecord requested, int amount) throws SQLException {
@@ -687,6 +699,95 @@ public final class EventService {
 
     public boolean hasValidPhysicalTicket(Player player, UUID eventId) throws SQLException {
         return physicalTicket(player, eventId).isPresent();
+    }
+
+    public void refreshAdmissionSnapshot() throws SQLException {
+        long now = System.currentTimeMillis();
+        Map<UUID, VenueRecord> venuesByClaim = new HashMap<>();
+        for (VenueRecord venue : venues()) venuesByClaim.put(venue.claimId(), venue);
+
+        Map<UUID, EventRecord> admissionEvents = new HashMap<>();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT * FROM gev_events WHERE status = 'SCHEDULED' AND start_at <= ? AND end_at >= ? ORDER BY start_at ASC")) {
+            statement.setLong(1, now + admissionEarlyMillis);
+            statement.setLong(2, now - admissionLateMillis);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    EventRecord record = readEvent(result);
+                    admissionEvents.putIfAbsent(record.venueId(), record);
+                }
+            }
+        }
+
+        Map<UUID, TicketAccess> validTickets = new HashMap<>();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT ticket_uuid, event_uuid, owner_uuid, transferable FROM gev_tickets WHERE status = 'VALID'");
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                UUID id = UUID.fromString(result.getString("ticket_uuid"));
+                validTickets.put(id, new TicketAccess(
+                        UUID.fromString(result.getString("event_uuid")),
+                        UUID.fromString(result.getString("owner_uuid")),
+                        result.getInt("transferable") != 0));
+            }
+        }
+
+        Map<UUID, VenueTicketAccess> validVenueTickets = new HashMap<>();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT ticket_uuid, venue_uuid, owner_uuid, transferable FROM gev_venue_tickets WHERE status = 'VALID'");
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                UUID id = UUID.fromString(result.getString("ticket_uuid"));
+                validVenueTickets.put(id, new VenueTicketAccess(
+                        UUID.fromString(result.getString("venue_uuid")),
+                        UUID.fromString(result.getString("owner_uuid")),
+                        result.getInt("transferable") != 0));
+            }
+        }
+
+        cachedVenuesByClaim = Map.copyOf(venuesByClaim);
+        cachedAdmissionEventsByVenue = Map.copyOf(admissionEvents);
+        cachedValidTickets = Map.copyOf(validTickets);
+        cachedValidVenueTickets = Map.copyOf(validVenueTickets);
+    }
+
+    public Optional<VenueRecord> venueAtCached(Location location) {
+        if (location == null || location.getWorld() == null) return Optional.empty();
+        UUID claimId = land.claimIdAt(location.getBlock()).orElse(null);
+        return claimId == null ? Optional.empty() : Optional.ofNullable(cachedVenuesByClaim.get(claimId));
+    }
+
+    public Optional<EventRecord> eventAcceptingAdmissionAtCached(VenueRecord venue) {
+        return venue == null ? Optional.empty() : Optional.ofNullable(cachedAdmissionEventsByVenue.get(venue.id()));
+    }
+
+    public boolean hasValidPhysicalTicketCached(Player player, UUID eventId) {
+        for (ItemStack item : player.getInventory().getContents()) {
+            if (item == null || item.getType() != Material.PAPER || !item.hasItemMeta()) continue;
+            String rawEvent = item.getItemMeta().getPersistentDataContainer().get(eventKey, PersistentDataType.STRING);
+            if (!eventId.toString().equals(rawEvent)) continue;
+            UUID id = ticketId(item).orElse(null);
+            TicketAccess access = id == null ? null : cachedValidTickets.get(id);
+            if (access != null && access.eventId().equals(eventId)
+                    && (access.transferable() || access.ownerId().equals(player.getUniqueId()))) return true;
+        }
+        return false;
+    }
+
+    public boolean hasValidPhysicalVenueTicketCached(Player player, UUID venueId) {
+        for (ItemStack item : player.getInventory().getContents()) {
+            if (item == null || item.getType() != Material.PAPER || !item.hasItemMeta()) continue;
+            String rawVenue = item.getItemMeta().getPersistentDataContainer().get(venueKey, PersistentDataType.STRING);
+            if (!venueId.toString().equals(rawVenue)) continue;
+            UUID id = venueTicketId(item).orElse(null);
+            VenueTicketAccess access = id == null ? null : cachedValidVenueTickets.get(id);
+            if (access != null && access.venueId().equals(venueId)
+                    && (access.transferable() || access.ownerId().equals(player.getUniqueId()))) return true;
+        }
+        return false;
     }
 
     public boolean hasValidPhysicalVenueTicket(Player player, UUID venueId) throws SQLException {
@@ -1611,4 +1712,10 @@ public final class EventService {
 
     public record CancellationResult(EventRecord event, int refundedTickets, long refundTotal) {
     }
+    private record TicketAccess(UUID eventId, UUID ownerId, boolean transferable) {
+    }
+
+    private record VenueTicketAccess(UUID venueId, UUID ownerId, boolean transferable) {
+    }
+
 }

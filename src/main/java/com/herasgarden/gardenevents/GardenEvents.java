@@ -69,6 +69,19 @@ public final class GardenEvents extends JavaPlugin {
             event.setTabCompleter(eventCommand);
         }
 
+        try {
+            events.refreshAdmissionSnapshot();
+        } catch (SQLException exception) {
+            getLogger().warning("Could not warm the venue admission cache: " + exception.getMessage());
+        }
+        getServer().getScheduler().runTaskTimerAsynchronously(this, () -> {
+            try {
+                events.refreshAdmissionSnapshot();
+            } catch (SQLException exception) {
+                getLogger().warning("Could not refresh the venue admission cache: " + exception.getMessage());
+            }
+        }, 20L, 20L);
+
         getServer().getPluginManager().registerEvents(new VenueAdmissionListener(events), this);
         getServer().getPluginManager().registerEvents(new TicketShopSignListener(this, events), this);
 
