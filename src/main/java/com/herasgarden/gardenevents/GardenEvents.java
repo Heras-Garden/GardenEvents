@@ -3,6 +3,7 @@ package com.herasgarden.gardenevents;
 import com.herasgarden.gardencore.api.GardenPlatform;
 import com.herasgarden.gardencore.api.land.LandAccessService;
 import com.herasgarden.gardencore.api.ui.GardenMessages;
+import com.herasgarden.gardenevents.api.SocietyEventDirectory;
 import com.herasgarden.gardenevents.command.EventCommand;
 import com.herasgarden.gardenevents.command.VenueCommand;
 import com.herasgarden.gardenevents.model.EventRecord;
@@ -12,6 +13,7 @@ import org.bukkit.Sound;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.RegisteredServiceProvider;
+import org.bukkit.plugin.ServicePriority;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.sql.SQLException;
@@ -54,6 +56,9 @@ public final class GardenEvents extends JavaPlugin {
                 getConfig().getInt("admission.closes-after-end-minutes", 15),
                 getConfig().getDouble("admission.radius-blocks", 8.0)
         );
+
+        getServer().getServicesManager().register(
+                SocietyEventDirectory.class, events, this, ServicePriority.Normal);
 
         VenueCommand venueCommand = new VenueCommand(events);
         PluginCommand venue = getCommand("venue");
