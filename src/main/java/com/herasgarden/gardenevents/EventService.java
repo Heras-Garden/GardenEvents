@@ -1,6 +1,7 @@
 package com.herasgarden.gardenevents;
 
 import com.herasgarden.gardencore.api.GardenPlatform;
+import com.herasgarden.gardenevents.api.SocietyEventDirectory;
 import com.herasgarden.gardencore.api.integration.IntegrationEventType;
 import com.herasgarden.gardencore.api.land.LandAccessService;
 import com.herasgarden.gardencore.api.order.GardenOrder;
@@ -40,7 +41,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-public final class EventService {
+public final class EventService implements SocietyEventDirectory {
     private final JavaPlugin plugin;
     private final GardenPlatform platform;
     private final LandAccessService land;
@@ -435,6 +436,154 @@ public final class EventService {
             try (ResultSet result = statement.executeQuery()) {
                 return result.next() ? result.getInt("n") : 0;
             }
+        }
+    }
+
+    @Override
+    public Optional<SocietyEventDirectory.Visit> nextVisit(long maxTicketPrice, long horizonMillis) throws SQLException {
+        long now = System.currentTimeMillis();
+        long horizon = Math.max(now, now + Math.max(60_000L, horizonMillis));
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT e.*,v.name venue_name,v.world_uuid,v.x,v.y,v.z "
+                             + "FROM gev_events e JOIN gev_venues v ON v.venue_uuid=e.venue_uuid "
+                             + "WHERE e.status='SCHEDULED' AND e.start_at>? AND e.start_at<=? "
+                             + "AND e.ticket_price<=? ORDER BY e.start_at ASC LIMIT 20")) {
+            statement.setLong(1, now);
+            statement.setLong(2, horizon);
+            statement.setLong(3, Math.max(0L, maxTicketPrice));
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    UUID eventId = UUID.fromString(result.getString("event_uuid"));
+                    if (soldTickets(eventId) >= result.getInt("capacity")) continue;
+                    return Optional.of(new SocietyEventDirectory.Visit(
+                            eventId,
+                            result.getString("name"),
+                            UUID.fromString(result.getString("venue_uuid")),
+                            result.getString("venue_name"),
+                            UUID.fromString(result.getString("world_uuid")),
+                            result.getDouble("x"), result.getDouble("y"), result.getDouble("z"),
+                            result.getLong("start_at"), result.getLong("end_at"),
+                            result.getLong("ticket_price")));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    @Override
+    public SocietyEventDirectory.PurchaseResult reserve(
+            UUID residentId, String residentName, UUID eventId) throws SQLException {
+        Object lock = purchaseLocks.computeIfAbsent(eventId, ignored -> new Object());
+        synchronized (lock) {
+            EventRecord event = findEvent(eventId).orElse(null);
+            if (event == null || !event.scheduled()) {
+                return SocietyEventDirectory.PurchaseResult.failure("That event is not accepting tickets.");
+            }
+            if (System.currentTimeMillis() >= event.startAt()) {
+                return SocietyEventDirectory.PurchaseResult.failure("Ticket sales have closed.");
+            }
+            if (event.hostId().equals(residentId)) {
+                return SocietyEventDirectory.PurchaseResult.failure("The resident hosts this event.");
+            }
+            if (hasValidTicket(residentId, eventId)) {
+                return SocietyEventDirectory.PurchaseResult.success(0L);
+            }
+            if (soldTickets(event.id()) >= event.capacity()) {
+                return SocietyEventDirectory.PurchaseResult.failure("That event is sold out.");
+            }
+
+            VenueRecord venue = venue(event);
+            GardenOrder order = platform.orders().create(
+                    OrderType.EVENT_TICKET,
+                    residentId,
+                    "PLAYER",
+                    event.hostId().toString(),
+                    event.ticketPrice(),
+                    "gardenevents.society-ticket",
+                    event.id().toString(),
+                    "{\"eventUuid\":\"" + event.id() + "\",\"venueUuid\":\"" + venue.id()
+                            + "\",\"buyerKind\":\"SOCIETY_CITIZEN\",\"buyerName\":\""
+                            + json(residentName) + "\"}"
+            );
+            platform.orders().transition(order.id(), OrderState.READY, "Society event capacity validated");
+            platform.orders().transition(order.id(), OrderState.AWAITING_CONFIRMATION, "Resident selected event");
+            platform.orders().transition(order.id(), OrderState.PAYMENT_PENDING, "Collecting Society ticket payment");
+
+            if (event.ticketPrice() > 0) {
+                if (!platform.currency().withdraw(residentId, event.ticketPrice())) {
+                    platform.orders().transition(order.id(), OrderState.PAYMENT_FAILED, "Resident has insufficient Obols");
+                    return SocietyEventDirectory.PurchaseResult.failure("The resident cannot afford this ticket.");
+                }
+                if (!platform.currency().deposit(event.hostId(), event.ticketPrice())) {
+                    platform.currency().deposit(residentId, event.ticketPrice());
+                    platform.orders().transition(order.id(), OrderState.REFUNDED, "Host payment failed; resident refunded");
+                    return SocietyEventDirectory.PurchaseResult.failure("The event host could not be paid.");
+                }
+            }
+
+            UUID ticketId = UUID.randomUUID();
+            try (Connection connection = platform.storage().connection();
+                 PreparedStatement statement = connection.prepareStatement(
+                         "INSERT INTO gev_tickets "
+                                 + "(ticket_uuid,event_uuid,owner_uuid,owner_kind,order_uuid,status,paid_amount,"
+                                 + "transferable,purchased_at,used_at,admitted_player_uuid,admitted_account_uuid) "
+                                 + "VALUES (?,?,?,?,?,'VALID',?,0,?,NULL,NULL,NULL)")) {
+                statement.setString(1, ticketId.toString());
+                statement.setString(2, event.id().toString());
+                statement.setString(3, residentId.toString());
+                statement.setString(4, "SOCIETY_CITIZEN");
+                statement.setString(5, order.id().toString());
+                statement.setLong(6, event.ticketPrice());
+                statement.setLong(7, System.currentTimeMillis());
+                statement.executeUpdate();
+            } catch (SQLException exception) {
+                if (event.ticketPrice() > 0 && platform.currency().withdraw(event.hostId(), event.ticketPrice())) {
+                    platform.currency().deposit(residentId, event.ticketPrice());
+                }
+                safeTransition(order.id(), OrderState.REFUNDED, "Society ticket creation failed; payment reversed");
+                throw exception;
+            }
+            platform.orders().transition(order.id(), OrderState.PAID, "Society ticket payment completed");
+            platform.orders().transition(order.id(), OrderState.FULFILLING, "Issuing account event ticket");
+            platform.orders().transition(order.id(), OrderState.COMPLETED, "Account event ticket issued");
+            return SocietyEventDirectory.PurchaseResult.success(event.ticketPrice());
+        }
+    }
+
+    @Override
+    public boolean hasValidTicket(UUID residentId, UUID eventId) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT 1 FROM gev_tickets WHERE event_uuid=? AND owner_uuid=? "
+                             + "AND owner_kind='SOCIETY_CITIZEN' AND status='VALID' LIMIT 1")) {
+            statement.setString(1, eventId.toString());
+            statement.setString(2, residentId.toString());
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        }
+    }
+
+    @Override
+    public boolean admit(UUID residentId, UUID eventId) throws SQLException {
+        EventRecord event = findEvent(eventId).orElse(null);
+        if (event == null) return false;
+        long now = System.currentTimeMillis();
+        if (now < event.startAt() - admissionEarlyMillis || now > event.endAt() + admissionLateMillis) {
+            return false;
+        }
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gev_tickets SET status='USED',used_at=?,admitted_account_uuid=? "
+                             + "WHERE ticket_uuid=(SELECT ticket_uuid FROM gev_tickets "
+                             + "WHERE event_uuid=? AND owner_uuid=? AND owner_kind='SOCIETY_CITIZEN' "
+                             + "AND status='VALID' ORDER BY purchased_at ASC LIMIT 1)")) {
+            statement.setLong(1, now);
+            statement.setString(2, residentId.toString());
+            statement.setString(3, eventId.toString());
+            statement.setString(4, residentId.toString());
+            return statement.executeUpdate() == 1;
         }
     }
 
@@ -1318,8 +1467,8 @@ public final class EventService {
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
                      "INSERT INTO gev_tickets "
-                             + "(ticket_uuid, event_uuid, owner_uuid, order_uuid, status, paid_amount, transferable, purchased_at, used_at) "
-                             + "VALUES (?, ?, ?, ?, 'VALID', ?, ?, ?, NULL)")) {
+                             + "(ticket_uuid, event_uuid, owner_uuid, owner_kind, order_uuid, status, paid_amount, transferable, purchased_at, used_at) "
+                             + "VALUES (?, ?, ?, 'PLAYER', ?, 'VALID', ?, ?, ?, NULL)")) {
             statement.setString(1, ticket.id().toString());
             statement.setString(2, ticket.eventId().toString());
             statement.setString(3, ticket.ownerId().toString());

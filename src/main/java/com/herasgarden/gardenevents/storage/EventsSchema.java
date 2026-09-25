@@ -68,12 +68,18 @@ public final class EventsSchema {
                     "ALTER TABLE gev_tickets ADD COLUMN transferable INTEGER NOT NULL DEFAULT 1");
             ensureColumn(connection, "gev_tickets", "admitted_player_uuid",
                     "ALTER TABLE gev_tickets ADD COLUMN admitted_player_uuid VARCHAR(36) NULL");
+            ensureColumn(connection, "gev_tickets", "owner_kind",
+                    "ALTER TABLE gev_tickets ADD COLUMN owner_kind VARCHAR(24) NOT NULL DEFAULT 'PLAYER'");
+            ensureColumn(connection, "gev_tickets", "admitted_account_uuid",
+                    "ALTER TABLE gev_tickets ADD COLUMN admitted_account_uuid VARCHAR(36) NULL");
             dropLegacyOwnerIndex(statement);
 
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gev_ticket_owner_event_lookup "
                     + "ON gev_tickets (event_uuid, owner_uuid, status)");
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gev_ticket_event "
                     + "ON gev_tickets (event_uuid, status, purchased_at)");
+            statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gev_ticket_account_owner "
+                    + "ON gev_tickets (owner_kind, owner_uuid, event_uuid, status)");
 
             statement.executeUpdate("CREATE TABLE IF NOT EXISTS gev_venue_tickets ("
                     + "ticket_uuid VARCHAR(36) PRIMARY KEY,"
